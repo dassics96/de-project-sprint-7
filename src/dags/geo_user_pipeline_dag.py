@@ -36,7 +36,7 @@ with DAG(
         task_id='user_geo_vitrina',
         name='User Geo Vitrina - {{ ds }}',
         application='/lessons/user_geo.py',
-        conn_id='spark_default',                    
+        conn_id='spark_default',                    # или твой spark connection в Airflow
         conf={
             'spark.executor.memory': '4g',
             'spark.executor.cores': '2',

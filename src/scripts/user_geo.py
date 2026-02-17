@@ -8,6 +8,7 @@ from pyspark.sql import Window
 from pyspark.sql.types import StringType
 from pyspark.sql.functions import split
 
+
 def haversine_expr(lat1_col, lon1_col, lat2_col, lon2_col):
     """Haversine formula в чистом Spark SQL без UDF"""
     lat1 = F.radians(lat1_col)
@@ -43,9 +44,9 @@ def get_timezone(city_col):
 
 
 def main():
-    #Аргументы командной строки
-    #Пример как запускать:
-    #spark-submit user_geo.py /user/master/data/geo/events /user/dburkh/data/geo/events /user/dburkh/analytics/user_geo
+    # Аргументы командной строки
+    # Пример запуска:
+    # spark-submit user_geo.py /user/master/data/geo/events /user/dburkh/data/geo/events /user/dburkh/analytics/user_geo
     source_events_path   = sys.argv[1]   # исходные события
     target_events_path   = sys.argv[2]   # куда переложить с партицией
     output_vitrina_path  = sys.argv[3]   # путь для витрины
@@ -59,7 +60,7 @@ def main():
     sql = SQLContext(sc)
 
     #----------------------------------------------------------------------------
-    # 1. Чтение исходных событий + ОГРАНИЧЕНИЕ ДАННЫХ ДЛЯ ОТЛАДКИ
+    # 1. Чтение исходных событий + ограничение данных для отладки
     #----------------------------------------------------------------------------
     events_raw = sql.read.parquet(source_events_path)
 
@@ -111,45 +112,34 @@ def main():
     #3. Чтение городов (geo.csv)
     #----------------------------------------------------------------------------
 
-    # 1. Читаем без header — все данные в одной колонке
-    # Читаем без header — Spark создаст колонку _c0
     raw = sql.read.option("header", "false").csv(geo_path)
 
-# Разбиваем _c0 по ";" на четыре колонки
     cities = raw.withColumn("id",   split("_c0", ";").getItem(0)) \
-            .withColumn("city", split("_c0", ";").getItem(1)) \
-            .withColumn("lat",  split("_c0", ";").getItem(2)) \
-            .withColumn("lng",  split("_c0", ";").getItem(3)) \
-            .drop("_c0")
+                .withColumn("city", split("_c0", ";").getItem(1)) \
+                .withColumn("lat",  split("_c0", ";").getItem(2)) \
+                .withColumn("lng",  split("_c0", ";").getItem(3)) \
+                .drop("_c0")
 
-# Теперь переименовываем lat/lng
     cities = cities.withColumnRenamed("lat", "orig_lat") \
-               .withColumnRenamed("lng", "orig_lng")
+                   .withColumnRenamed("lng", "orig_lng")
 
-# Очищаем запятые и приводим к double
     cities = cities.withColumn("city_lat", F.regexp_replace(F.col("orig_lat"), ",", ".").cast("double"))
     cities = cities.withColumn("city_lon", F.regexp_replace(F.col("orig_lng"), ",", ".").cast("double"))
 
-# Финальный отбор и приведение типов
     cities = cities.select(
-    F.col("id").cast("string").alias("city_id"),
-    F.col("city"),
-    F.col("city_lat"),
-    F.col("city_lon")
-)
+        F.col("id").cast("string").alias("city_id"),
+        F.col("city"),
+        F.col("city_lat"),
+        F.col("city_lon")
+    )
 
-# Обязательно для проверки 
-    print("Схема после парсинга geo.csv:")
-    cities.printSchema()
-
-    print("Первые 5 строк:")
-    cities.show(5, truncate=False)
     #----------------------------------------------------------------------------
-    # 4. Определение ближайшего города для каждого события
+    #4. Определение ближайшего города для каждого события
     #----------------------------------------------------------------------------
     cities_bc = F.broadcast(cities)
 
     with_distance = events.crossJoin(cities_bc) \
+        .withColumnRenamed("city", "city_from_geo") \
         .withColumn("distance_km", haversine_expr("lat", "lon", "city_lat", "city_lon"))
 
     w_nearest = Window.partitionBy("user_id", "event_time_utc").orderBy("distance_km")
@@ -162,49 +152,70 @@ def main():
                                   "event_time_utc",
                                   "event_type",
                                   "date",
-                                  "city",
+                                  F.col("city_from_geo").alias("city"),
                                   "city_id"
                               )
 
     #----------------------------------------------------------------------------
-    # 5. act_city — город последнего события
+    #5. Метрики путешествий
     #----------------------------------------------------------------------------
+
+    # Окно для упорядочивания событий пользователя по времени
+    w_travel = Window.partitionBy("user_id").orderBy("event_time_utc")
+
+    travel_metrics = geo_events.withColumn(
+    "rn", F.row_number().over(w_travel)).groupBy("user_id").agg(
+    F.count("*").alias("travel_count"),
+    F.collect_list("city").alias("travel_array_raw")).withColumn(
+    "travel_array",
+    F.filter("travel_array_raw", lambda x: x.isNotNull())).drop("travel_array_raw")
+
+#----------------------------------------------------------------------------
+#6. Последнее событие пользователя — город, локальное время, timezone
+#----------------------------------------------------------------------------
+
     w_last = Window.partitionBy("user_id").orderBy(F.desc("event_time_utc"))
 
-    act_city_df = geo_events.withColumn("rn", F.row_number().over(w_last)) \
-                            .filter("rn = 1") \
-                            .select(
-                                "user_id",
-                                F.col("city").alias("act_city")
-                            )
-
-    #----------------------------------------------------------------------------
-    #6. local_time последнего события с учётом timezone
-    #----------------------------------------------------------------------------
-    last_event = geo_events.withColumn("rn", F.row_number().over(w_last)) \
-                           .filter("rn = 1") \
-                           .select("user_id", "event_time_utc", "city")
-
-    last_with_tz = last_event.withColumn("timezone", get_timezone(F.col("city")))
-
-    last_with_local = last_with_tz.withColumn(
+    last_event_enriched = geo_events.withColumn("rn", F.row_number().over(w_last)) \
+    .filter("rn = 1") \
+    .drop("rn") \
+    .withColumn("timezone", get_timezone(F.col("city"))) \
+    .withColumn(
         "local_time",
         F.from_utc_timestamp(F.col("event_time_utc"), F.col("timezone"))
-    ).select("user_id", "local_time")
+    ) \
+    .select(
+        "user_id",
+        F.col("city").alias("act_city"),
+        "local_time"
+    )
 
-    #----------------------------------------------------------------------------
-    #7.Итоговая витрина 
-    #----------------------------------------------------------------------------
-    vitrina = act_city_df.join(
-        last_with_local, "user_id", "left_outer"
-    ).withColumn("calc_date", F.lit(today))
+   # ----------------------------------------------------------------------------
+#7. Итоговая витрина — объединяем с метриками путешествий
+# ----------------------------------------------------------------------------
 
-    #Сохранение витрины
+    vitrina = last_event_enriched \
+    .join(travel_metrics, "user_id", "left_outer") \
+    .withColumn("calc_date", F.lit(today)) \
+    .withColumn("travel_count", F.coalesce(F.col("travel_count"), F.lit(0))) \
+    .withColumn("travel_array", F.coalesce(F.col("travel_array"), F.array())) \
+    .select(
+        "user_id",
+        "act_city",
+        "local_time",
+        "travel_count",
+        "travel_array",
+        "calc_date"
+    )
+
+    # Сохранение витрины
     vitrina.write \
            .mode("overwrite") \
            .partitionBy("calc_date") \
            .format("parquet") \
            .save(output_vitrina_path)
+
+    print(f"Витрина сохранена: {output_vitrina_path}/calc_date={today}")
 
     sc.stop()
 

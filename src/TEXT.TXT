@@ -1,0 +1,10 @@
+
+# Создаём директорию (если ещё нет)
+hdfs dfs -mkdir -p /user/master/data/geo
+
+# Кладём файл
+hdfs dfs -put geo.csv /user/dburkh/data/geo/geo.csv
+
+hdfs dfs -ls -h /user/dburkh/data/geo
+hdfs dfs -tail /user/dburkh/data/geo/geo.csv   # последние строки файла
+
