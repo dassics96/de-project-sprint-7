@@ -8,3 +8,29 @@ hdfs dfs -put geo.csv /user/dburkh/data/geo/geo.csv
 hdfs dfs -ls -h /user/dburkh/data/geo
 hdfs dfs -tail /user/dburkh/data/geo/geo.csv   # последние строки файла
 
+#user_geo_vitrina
+
+from pyspark.sql import SparkSession
+import pyspark
+from pyspark.sql import SparkSession
+spark = SparkSession.builder \
+                    .master("local") \
+                    .appName("View user_geo") \
+                    .getOrCreate()
+
+events  = spark.read.parquet("/user/dburkh/analytics/user_geo/calc_date=2026-02-18")
+events.show(10,False)
++-------+-----------+-------------------+-----------+------------+--------------------------------------------------------------------------------------------------------------------+
+|user_id|act_city   |local_time         |home_city  |travel_count|travel_array                                                                                                        |
++-------+-----------+-------------------+-----------+------------+--------------------------------------------------------------------------------------------------------------------+
+|24     |Rockhampton|2022-04-02 17:24:24|Rockhampton|1           |[Rockhampton]                                                                                                       |
+|45     |Melbourne  |2022-05-30 07:53:40|Melbourne  |4           |[Brisbane, Melbourne, Sydney, Melbourne]                                                                            |
+|47     |Melbourne  |2022-05-27 18:26:58|Melbourne  |7           |[Adelaide, Darwin, Bendigo, Townsville, Newcastle, Perth, Melbourne]                                                |
+|53     |Cairns     |2022-05-23 14:05:50|Cairns     |2           |[Rockhampton, Cairns]                                                                                               |
+|148    |Melbourne  |2022-05-30 13:18:17|Melbourne  |8           |[Mackay, Launceston, Brisbane, Cairns, Melbourne, Bendigo, Mackay, Melbourne]                                       |
+|152    |Cairns     |2022-05-29 05:19:05|Cairns     |6           |[Brisbane, Cranbourne, Sydney, Darwin, Sydney, Cairns]                                                              |
+|169    |Melbourne  |2022-05-31 09:57:30|Melbourne  |2           |[Bendigo, Melbourne]                                                                                                |
+|211    |Mackay     |2022-05-28 04:25:53|Mackay     |5           |[Sydney, Adelaide, Toowoomba, Newcastle, Mackay]                                                                    |
+|267    |Toowoomba  |2022-05-27 13:29:42|Toowoomba  |3           |[Melbourne, Bendigo, Toowoomba]                                                                                     |
+|273    |Townsville |2022-05-23 11:13:51|Townsville |13          |[Perth, Brisbane, Perth, Brisbane, Perth, Darwin, Perth, Canberra, Bendigo, Rockhampton, Darwin, Sydney, Townsville]|
++-------+-----------+-------------------+-----------+------------+--------------------------------------------------------------------------------------------------------------------+

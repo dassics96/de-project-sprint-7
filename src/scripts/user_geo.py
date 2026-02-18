@@ -112,67 +112,83 @@ def main():
     #3. Чтение городов (geo.csv)
     #----------------------------------------------------------------------------
 
-    raw = sql.read.option("header", "false").csv(geo_path)
+    raw = sql.read \
+    .option("header", "true") \
+    .option("delimiter", ";") \
+    .csv("/user/dburkh/data/geo/geo.csv")
 
-    cities = raw.withColumn("id",   split("_c0", ";").getItem(0)) \
-                .withColumn("city", split("_c0", ";").getItem(1)) \
-                .withColumn("lat",  split("_c0", ";").getItem(2)) \
-                .withColumn("lng",  split("_c0", ";").getItem(3)) \
-                .drop("_c0")
-
+    cities = raw.select(
+    F.col("id").cast("string").alias("city_id"),
+    F.col("city"),
+    # Replace comma with dot and cast to double — in one step
+    F.regexp_replace(F.col("lat"), ",", ".").cast("double").alias("city_lat"),
+    F.regexp_replace(F.col("lng"), ",", ".").cast("double").alias("city_lon")
+    )
     cities = cities.withColumnRenamed("lat", "orig_lat") \
                    .withColumnRenamed("lng", "orig_lng")
 
-    cities = cities.withColumn("city_lat", F.regexp_replace(F.col("orig_lat"), ",", ".").cast("double"))
-    cities = cities.withColumn("city_lon", F.regexp_replace(F.col("orig_lng"), ",", ".").cast("double"))
-
     cities = cities.select(
-        F.col("id").cast("string").alias("city_id"),
+        F.col("city_id"),
         F.col("city"),
         F.col("city_lat"),
         F.col("city_lon")
     )
-
+    
     #----------------------------------------------------------------------------
     #4. Определение ближайшего города для каждого события
     #----------------------------------------------------------------------------
+    events_clean = events.drop("city", "city_id")  # если они там есть — удаляем
+
     cities_bc = F.broadcast(cities)
 
-    with_distance = events.crossJoin(cities_bc) \
-        .withColumnRenamed("city", "city_from_geo") \
-        .withColumn("distance_km", haversine_expr("lat", "lon", "city_lat", "city_lon"))
+    with_distance = events_clean.crossJoin(cities_bc) \
+    .withColumnRenamed("city", "lookup_city") \
+    .withColumnRenamed("city_id", "lookup_city_id") \
+    .withColumn("distance_km", haversine_expr("lat", "lon", "city_lat", "city_lon"))
+
 
     w_nearest = Window.partitionBy("user_id", "event_time_utc").orderBy("distance_km")
 
     geo_events = with_distance.withColumn("rn", F.row_number().over(w_nearest)) \
-                              .filter("rn = 1") \
-                              .drop("rn", "distance_km", "city_lat", "city_lon") \
-                              .select(
-                                  "user_id",
-                                  "event_time_utc",
-                                  "event_type",
-                                  "date",
-                                  F.col("city_from_geo").alias("city"),
-                                  "city_id"
-                              )
+    .filter("rn = 1") \
+    .drop("rn", "distance_km", "city_lat", "city_lon") \
+    .select(
+        "user_id",
+        "event_time_utc",
+        "event_type",
+        "date",
+        F.col("lookup_city").alias("city"),        # ТОЛЬКО из справочника!
+        F.col("lookup_city_id").alias("city_id")   # ТОЛЬКО из справочника!
+    )
 
     #----------------------------------------------------------------------------
-    #5. Метрики путешествий
+    #5.Метрики путешествий, список без идущих подряд повторов
     #----------------------------------------------------------------------------
-
     # Окно для упорядочивания событий пользователя по времени
     w_travel = Window.partitionBy("user_id").orderBy("event_time_utc")
 
-    travel_metrics = geo_events.withColumn(
-    "rn", F.row_number().over(w_travel)).groupBy("user_id").agg(
-    F.count("*").alias("travel_count"),
-    F.collect_list("city").alias("travel_array_raw")).withColumn(
-    "travel_array",
-    F.filter("travel_array_raw", lambda x: x.isNotNull())).drop("travel_array_raw")
+    #Добавляем предыдущий город и флаг изменения
+    travel_with_prev = geo_events.withColumn(
+    "prev_city", F.lag("city").over(w_travel)
+    ).withColumn(
+    "is_new_visit",
+    F.when(
+        (F.col("city") != F.col("prev_city")) | F.col("prev_city").isNull(),
+        1
+    ).otherwise(0)
+    )
 
-#----------------------------------------------------------------------------
-#6. Последнее событие пользователя — город, локальное время, timezone
-#----------------------------------------------------------------------------
+    #Оставляем только строки, где началось новое посещение (или первая строка)
+    travel_visits = travel_with_prev.filter(F.col("is_new_visit") == 1)
+
+    #Теперь агрегируем: считаем количество посещений и собираем список
+    travel_metrics = travel_visits.groupBy("user_id").agg(
+    F.count("*").alias("travel_count"),           # количество реальных посещений
+    F.collect_list("city").alias("travel_array")  # список без идущих подряд дублей
+    )
+   #----------------------------------------------------------------------------
+   #6.Последнее событие пользователя-город, локальное время, timezone
+   #----------------------------------------------------------------------------
 
     w_last = Window.partitionBy("user_id").orderBy(F.desc("event_time_utc"))
 
@@ -189,20 +205,78 @@ def main():
         F.col("city").alias("act_city"),
         "local_time"
     )
+    
+    #----------------------------------------------------------------------------
+    #7. Домашний город — где пользователь непрерывно пребывал > 27 дней 
+    #----------------------------------------------------------------------------
+    # Шаг 1:Distinct даты по пользователю и городу 
+    distinct_days = geo_events.select(
+    "user_id",
+    "city",
+    F.to_date("event_time_utc").alias("stay_date")
+    ).distinct()
 
-   # ----------------------------------------------------------------------------
-#7. Итоговая витрина — объединяем с метриками путешествий
-# ----------------------------------------------------------------------------
+    #Шаг 2:Упорядочивание по пользователю и дате
+    w_stay = Window.partitionBy("user_id").orderBy("stay_date")
 
-    vitrina = last_event_enriched \
-    .join(travel_metrics, "user_id", "left_outer") \
-    .withColumn("calc_date", F.lit(today)) \
-    .withColumn("travel_count", F.coalesce(F.col("travel_count"), F.lit(0))) \
-    .withColumn("travel_array", F.coalesce(F.col("travel_array"), F.array())) \
+    #Шаг 3:Определяем смены города и предыдущую дату
+    stays_with_lag = distinct_days.withColumn(
+    "prev_city", F.lag("city").over(w_stay)
+    ).withColumn(
+    "prev_date", F.lag("stay_date").over(w_stay)
+    ).withColumn(
+    "is_new_stay",
+    F.when(
+        (F.col("city") != F.col("prev_city")) | F.col("prev_city").isNull() |
+        (F.col("stay_date") != F.col("prev_date") + 1),  # не непрерывный день
+        1
+    ).otherwise(0)
+    )
+
+    #Шаг 4:Присваиваем ID группе непрерывного пребывания (cumulative sum)
+    stays_grouped = stays_with_lag.withColumn(
+    "stay_group",
+    F.sum("is_new_stay").over(w_stay)
+    )
+
+    #Шаг 5:Агрегируем по группам — min/max дата, длительность в днях
+    stay_periods = stays_grouped.groupBy(
+    "user_id", "city", "stay_group"
+    ).agg(
+    F.min("stay_date").alias("start_date"),
+    F.max("stay_date").alias("end_date"),
+    (F.datediff(F.max("stay_date"), F.min("stay_date")) + 1).alias("duration_days")
+    ).orderBy("user_id", "start_date")
+
+    #Шаг 6: Фильтруем периоды > 27 дней
+    long_stays = stay_periods.filter("duration_days > 27")
+
+    #Шаг 7: Для каждого пользователя берём последний такой период (max end_date)
+    w_home = Window.partitionBy("user_id").orderBy(F.desc("end_date"))
+
+    home_city_df = long_stays.withColumn(
+    "rn", F.row_number().over(w_home)
+    ).filter("rn = 1") \
     .select(
+     "user_id",
+     F.col("city").alias("home_city")
+    )
+
+    # ----------------------------------------------------------------------------
+    #8.Итоговая витрина—объединяем с метриками путешествий
+    # ----------------------------------------------------------------------------
+    vitrina = last_event_enriched \
+        .join(travel_metrics, "user_id", "left_outer") \
+        .join(home_city_df, "user_id", "left_outer") \
+        .withColumn("calc_date", F.lit(today)) \
+        .withColumn("travel_count", F.coalesce(F.col("travel_count"), F.lit(0))) \
+        .withColumn("travel_array", F.coalesce(F.col("travel_array"), F.array())) \
+        .withColumn("home_city", F.coalesce(F.col("home_city"), F.col("act_city"))) \
+        .select(
         "user_id",
         "act_city",
         "local_time",
+        "home_city",
         "travel_count",
         "travel_array",
         "calc_date"
